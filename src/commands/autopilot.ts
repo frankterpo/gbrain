@@ -22,7 +22,8 @@ import { join } from 'path';
 import { execSync } from 'child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadPreferences } from '../core/preferences.ts';
-import { loadConfig, gbrainPath as gbrainHomePath } from '../core/config.ts';
+import { loadConfig, toEngineConfig, gbrainPath as gbrainHomePath } from '../core/config.ts';
+import { GBrainError } from '../core/types.ts';
 import { ChildWorkerSupervisor } from '../core/minions/child-worker-supervisor.ts';
 
 /**
@@ -333,8 +334,40 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
       autopilotReconnectFails = 0; // reset on success
     } catch (probeErr) {
       try {
-        await engine.disconnect();
-        await (engine as any).connect?.();
+        // v0.41.28.1 #1591: reconnect via the SAME source of truth the
+        // initial connect used, not a config-less `connect()`. Pre-fix this
+        // called `engine.connect?.()` with NO argument, so
+        // PostgresEngine.connect immediately dereferenced
+        // `config.database_url` on `undefined` and threw "undefined is not
+        // an object (evaluating 'config.database_url')". classifyReconnectError
+        // then matched database_url+undefined → unrecoverable → the daemon
+        // exited 1 every tick and launchd crash-looped it (throttled to 60s).
+        // The bug fired whenever the health probe failed — e.g. the #1570
+        // mid-cycle singleton disconnect — even though config.json had a
+        // perfectly valid database_url the whole time.
+        //
+        // PostgresEngine.reconnect() tears down and rebuilds the pool from the
+        // config it was originally connected with (`_savedConfig`) — the exact
+        // path the Minions supervisor already uses. For engines without a
+        // reconnect() (and as a belt-and-suspenders fallback) we re-resolve the
+        // connection from loadConfig()/toEngineConfig — the identical loader the
+        // working CLI read path uses — and fail loud with an actionable message
+        // if database_url is genuinely absent.
+        const maybeReconnect = (engine as Partial<{ reconnect(): Promise<void> }>).reconnect;
+        if (typeof maybeReconnect === 'function') {
+          await maybeReconnect.call(engine);
+        } else {
+          await engine.disconnect();
+          const cfg = loadConfig();
+          if (!cfg?.database_url) {
+            throw new GBrainError(
+              'autopilot reconnect failed',
+              'database_url is missing/empty (checked ~/.gbrain/config.json and GBRAIN_DATABASE_URL/DATABASE_URL)',
+              'Run `gbrain init --url <connection_string>` or set DATABASE_URL in the daemon environment',
+            );
+          }
+          await engine.connect(toEngineConfig(cfg));
+        }
         autopilotReconnectFails = 0;
       } catch (e) {
         logError('reconnect', e);
