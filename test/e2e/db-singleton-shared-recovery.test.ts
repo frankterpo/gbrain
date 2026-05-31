@@ -49,11 +49,17 @@ describe.skipIf(skip)('v0.41.25.0 db-singleton shared-recovery regressions (#157
     tmpAuditDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-1570-e2e-'));
   });
 
-  test('CASE 1: shared singleton survives mid-operation disconnect via retry reconnect', async () => {
-    // Reproduce the dream-cycle scenario: caller A is mid-batch, caller B
-    // disconnects the module singleton, caller A's NEXT attempt enters
-    // retry and the reconnect callback rebuilds the singleton before the
-    // retry's fn fires. This is the symptom-fix contract we ship.
+  test('CASE 1: a co-tenant borrower disconnect no longer nulls the shared singleton (ownership-boundary root fix)', async () => {
+    // Reproduce the dream/autopilot-cycle scenario: two callers share the
+    // module singleton; caller B tears its engine down mid-cycle. v0.41.25
+    // shipped a SYMPTOM fix — B's disconnect nulled the singleton and a
+    // retry-reconnect layer papered over the gap. The disconnect audit then
+    // identified the offending caller (lint's `connect({})` DB-plane lift),
+    // and this is the ROOT fix the audit comments anticipated ("v0.41.26
+    // patches the specific ownership boundary"): a BORROWER engine — one
+    // that reused an already-live singleton it didn't create — must never
+    // call db.disconnect() on teardown, so a co-tenant disconnect leaves
+    // the shared connection fully intact.
     await db.connect({ database_url: DATABASE_URL! });
 
     const engineA = new PostgresEngine();
@@ -65,24 +71,22 @@ describe.skipIf(skip)('v0.41.25.0 db-singleton shared-recovery regressions (#157
     expect((await engineA.sql`SELECT 1 as ok`)[0].ok).toBe(1);
     expect((await engineB.sql`SELECT 1 as ok`)[0].ok).toBe(1);
 
-    // Engine B disconnects mid-operation (the "offending caller" scenario).
-    // This nulls the module singleton for engine A too.
+    // Engine B (a borrower) disconnects mid-operation — the exact shape of
+    // the "offending caller" the audit pinned. Post-root-fix this is a
+    // no-op against the shared singleton.
     await engineB.disconnect();
 
-    // Engine A's direct unsafe call will throw — proving the bug class
-    // exists at the engine.sql layer.
-    let directThrew = false;
-    try {
-      await engineA.sql`SELECT 1`;
-    } catch {
-      directThrew = true;
-    }
-    expect(directThrew).toBe(true);
+    // Engine A's call now SUCCEEDS — the singleton was never nulled. Pre-fix
+    // this threw "No database connection", which is the failure that crashed
+    // the autopilot worker on the conversation_facts_backfill phase.
+    expect(db.isConnected()).toBe(true);
+    const afterCoTenantDisconnect = await engineA.sql`SELECT 1 as ok`;
+    expect(afterCoTenantDisconnect[0].ok).toBe(1);
 
-    // The retry layer's reconnect callback recovers. We exercise it via
-    // engine.reconnect() directly (which is what batchRetry's injected
-    // reconnect callback calls). After reconnect, engine A's next call
-    // succeeds.
+    // Defense-in-depth: the retry layer's reconnect callback remains
+    // available (the watchdog still calls engine.reconnect() on genuine
+    // connection death) and is safe to invoke even when the singleton is
+    // healthy.
     await engineA.reconnect();
     const afterRecovery = await engineA.sql`SELECT 1 as ok`;
     expect(afterRecovery[0].ok).toBe(1);

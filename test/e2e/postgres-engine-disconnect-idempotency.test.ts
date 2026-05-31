@@ -77,11 +77,46 @@ describe.skipIf(skip)('PostgresEngine.disconnect idempotency', () => {
     // No poolSize → uses the module-level singleton.
     await engine.connect({ database_url: DATABASE_URL! });
 
-    // First disconnect closes module-level singleton (this engine owned it).
+    // First disconnect. The module singleton already existed (beforeAll +
+    // the db.connect() above), so this engine is a BORROWER, not the owner
+    // (#1570). Borrower disconnect leaves the shared singleton intact — see
+    // the dedicated regression below. Either way it must not throw.
     await engine.disconnect();
 
     // Second disconnect must NOT throw — should be a no-op since
     // _connectionStyle was reset to null.
     await expect(engine.disconnect()).resolves.toBeUndefined();
+  });
+
+  test('#1570: a borrower engine that reused the shared singleton must NOT clobber it on disconnect', async () => {
+    // The shared module singleton is live for the whole "cycle" — this
+    // mirrors the autopilot worker, whose main engine OWNS the singleton
+    // for the duration of runCycle().
+    await db.connect({ database_url: DATABASE_URL! });
+    expect(db.isConnected()).toBe(true);
+
+    // A throwaway "borrower" engine reuses the live singleton — exactly what
+    // lint's resolveLintContentSanity() does via `engine.connect({})` to read
+    // a few config keys from the DB plane mid-cycle. db.connect() early-
+    // returns (reuse) because a connection already exists, so this engine
+    // never created the singleton and must not own its teardown.
+    const borrower = new PostgresEngine();
+    await borrower.connect({}); // empty config — identical to lint's call
+
+    // Pre-fix, this fell through to db.disconnect() and NULLED the shared
+    // singleton mid-cycle. The next phase (conversation_facts_backfill)
+    // then threw "No database connection: connect() has not been called",
+    // and the worker's own failure-recording write hit the same error →
+    // unhandled rejection → `worker exited code=1`.
+    await borrower.disconnect();
+
+    // The shared singleton MUST still be alive for the rest of the cycle.
+    expect(db.isConnected()).toBe(true);
+    const rows = await db.getConnection().unsafe('SELECT 1 as ok');
+    expect((rows[0] as unknown as { ok: number }).ok).toBe(1);
+
+    // And the true owner can still tear it down explicitly afterwards.
+    await db.disconnect();
+    expect(db.isConnected()).toBe(false);
   });
 });

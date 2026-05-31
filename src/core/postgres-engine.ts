@@ -106,6 +106,21 @@ export class PostgresEngine implements BrainEngine {
   private _connectionStyle: 'instance' | 'module' | null = null;
 
   /**
+   * #1570 ownership boundary. True only when THIS engine actually created
+   * the module-level db singleton (db.connect() found no live connection).
+   * An engine that connected while a singleton already existed is a
+   * BORROWER — it reuses the shared connection (e.g. lint's DB-plane config
+   * lift via `connect({})`) but must NOT call db.disconnect() on teardown.
+   *
+   * Pre-fix, lint's throwaway engine (and any other module-style borrower)
+   * tore down the shared singleton mid-cycle, nulling the connection the
+   * autopilot worker, promoteDelayed and the conversation_facts_backfill
+   * phase still depended on → "No database connection" → worker exit 1.
+   * Only meaningful when _connectionStyle === 'module'.
+   */
+  private _ownsModuleSingleton = false;
+
+  /**
    * v0.30.1 (Fix 1 + X1 + T5): instance-owned ConnectionManager.
    * - INSTANCE-owned: each PostgresEngine constructs its own.
    * - Worker engines (cycle, sync) inherit via opts.parentConnectionManager.
@@ -177,9 +192,15 @@ export class PostgresEngine implements BrainEngine {
       });
       this.connectionManager.setReadPool(this._sql);
     } else {
-      // Module-level singleton (backward compat for CLI main engine)
+      // Module-level singleton (backward compat for CLI main engine).
+      // #1570 ownership: capture whether a singleton already existed BEFORE
+      // we call db.connect(). db.connect() early-returns (reuses) when a
+      // connection is live, so `alreadyConnected` tells us if we created the
+      // singleton (owner) or are merely borrowing it (must not tear it down).
+      const alreadyConnected = db.isConnected();
       await db.connect(config);
       this._connectionStyle = 'module';
+      this._ownsModuleSingleton = !alreadyConnected;
 
       // v0.30.1: connection-manager wraps the module singleton.
       if (url) {
@@ -220,8 +241,17 @@ export class PostgresEngine implements BrainEngine {
       return;
     }
     if (this._connectionStyle === 'module') {
-      await db.disconnect();
+      // #1570: only the engine that CREATED the singleton may tear it down.
+      // Borrower engines (reused an existing singleton, e.g. lint's
+      // `connect({})` DB-plane lift) must leave the shared connection intact
+      // for the still-running cycle/worker. Without this guard, lint's
+      // throwaway engine nulled the singleton every cycle, crashing the
+      // worker on the conversation_facts_backfill phase.
+      if (this._ownsModuleSingleton) {
+        await db.disconnect();
+      }
       this._connectionStyle = null;
+      this._ownsModuleSingleton = false;
     }
     // else: nothing to disconnect (already done or never connected)
   }

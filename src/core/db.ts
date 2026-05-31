@@ -159,6 +159,18 @@ export function getConnection(): ReturnType<typeof postgres> {
   return sql;
 }
 
+/**
+ * Whether the module-level singleton connection currently exists.
+ *
+ * Used by PostgresEngine.connect() to establish singleton OWNERSHIP
+ * (#1570): an engine that reuses an already-live singleton is a BORROWER
+ * and must never tear it down on disconnect(). See the ownership boundary
+ * in PostgresEngine.connect()/disconnect().
+ */
+export function isConnected(): boolean {
+  return sql !== null;
+}
+
 export async function connect(config: EngineConfig): Promise<void> {
   if (sql) {
     // Warn if a different URL is passed — the old connection is still in use
