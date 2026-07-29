@@ -28,6 +28,14 @@ export interface SourceRow {
   config: Record<string, unknown> | string;
   created_at: Date;
   archived?: boolean;
+  /**
+   * v0.41.32.0: newest COMMIT timestamp observed at last sync (HEAD committer
+   * time). The REMOTE staleness path reads this column so it never shells out
+   * to git on a DB-supplied local_path. Optional because the forward-reference
+   * fallback SELECT below omits it on pre-v109 brains; null/undefined → the
+   * reader falls back to wall-clock.
+   */
+  newest_content_at?: Date | null;
 }
 
 export interface LoadAllSourcesOpts {
@@ -37,13 +45,107 @@ export interface LoadAllSourcesOpts {
   federatedOnly?: boolean;
 }
 
-/** Parse `sources.config` to a plain object regardless of driver shape. */
-export function parseSourceConfig(config: unknown): Record<string, unknown> {
-  if (typeof config === 'string') {
-    try { return JSON.parse(config) as Record<string, unknown>; } catch { return {}; }
+/**
+ * #2829: max JSON.parse passes when unwrapping a possibly multiply-stringified
+ * `sources.config`. A re-wrapping bug could store config as a JSON *string
+ * scalar* ("{}", "\"{}\"", ...) that grows one layer per read→write cycle; the
+ * bound keeps a pathological value from spinning forever.
+ */
+const MAX_CONFIG_UNWRAP_DEPTH = 10;
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** Unwrap a value that may be JSON-stringified 0..N times. Bounded; never throws. */
+function unwrapConfigLayers(config: unknown): { value: unknown; layers: number } {
+  let value = config;
+  let layers = 0;
+  while (typeof value === 'string' && layers < MAX_CONFIG_UNWRAP_DEPTH) {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      break;
+    }
+    layers++;
   }
-  if (typeof config === 'object' && config !== null) return config as Record<string, unknown>;
+  return { value, layers };
+}
+
+/**
+ * Recover the canonical object from historical config shapes.
+ *
+ * A naive JSONB `||` merge could turn a string-shaped config plus an object
+ * patch into an array. Those arrays are an ordered sequence of config
+ * fragments, so merge recoverable object fragments left-to-right. This keeps
+ * the latest patch authoritative while preserving keys from older fragments.
+ */
+function coerceSourceConfigObject(config: unknown): {
+  value: Record<string, unknown> | null;
+  layers: number;
+  recoveredArray: boolean;
+} {
+  const root = unwrapConfigLayers(config);
+  if (isPlainObject(root.value)) {
+    return { value: root.value, layers: root.layers, recoveredArray: false };
+  }
+  if (!Array.isArray(root.value)) {
+    return { value: null, layers: root.layers, recoveredArray: false };
+  }
+
+  const merged: Record<string, unknown> = {};
+  let objectFragments = 0;
+  let layers = root.layers;
+  for (const fragment of root.value) {
+    const unwrapped = unwrapConfigLayers(fragment);
+    layers += unwrapped.layers;
+    if (!isPlainObject(unwrapped.value)) continue;
+    Object.assign(merged, unwrapped.value);
+    objectFragments++;
+  }
+  return {
+    value: objectFragments > 0 ? merged : null,
+    layers,
+    recoveredArray: objectFragments > 0,
+  };
+}
+
+/**
+ * #2829: coerce a config value to the underlying plain object before it is
+ * written back, fully unwrapping any accidental JSON-string nesting so a
+ * re-wrapping bug can't keep growing a layer on every write. Returns {} (with a
+ * warning) when the value never resolves to a plain object. Every `sources`
+ * config writer runs its config through this before `JSON.stringify` + the
+ * `$1::text::jsonb` cast, which converges the stored value back to a jsonb
+ * object.
+ */
+export function normalizeSourceConfig(config: unknown): Record<string, unknown> {
+  const { value } = coerceSourceConfigObject(config);
+  if (value) return value;
+  console.warn(
+    `[gbrain] source config was not a recoverable JSON object; ` +
+    `storing {} instead. Run 'gbrain doctor' to find affected sources.`,
+  );
   return {};
+}
+
+/**
+ * Parse `sources.config` to a plain object regardless of driver shape (Postgres
+ * returns an object; PGLite returns a JSON string). #2829: also unwraps a config
+ * that was accidentally stored as a nested JSON string scalar, and warns once
+ * when more than one unwrap layer is needed (one layer is the normal PGLite
+ * path; two or more means the value was re-wrapped and should be repaired).
+ */
+export function parseSourceConfig(config: unknown): Record<string, unknown> {
+  const { value, layers, recoveredArray } = coerceSourceConfigObject(config);
+  if (layers > 1 || recoveredArray) {
+    const shape = recoveredArray ? 'historical JSON array' : `${layers}-layer nested JSON string`;
+    console.warn(
+      `[gbrain] source config was stored as a ${shape}; ` +
+      `it will be repaired on the next config write. Run 'gbrain doctor' to find affected sources.`,
+    );
+  }
+  return value ?? {};
 }
 
 /** True iff the source's config.federated field is the literal boolean true. */
@@ -67,13 +169,14 @@ export async function loadAllSources(
   let rows: SourceRow[];
   try {
     rows = await engine.executeRaw<SourceRow>(
-      `SELECT id, name, local_path, last_commit, last_sync_at, config, created_at, archived
+      `SELECT id, name, local_path, last_commit, last_sync_at, config, created_at, archived, newest_content_at
          FROM sources
        ORDER BY (id = 'default') DESC, id`,
     );
   } catch (err) {
-    // Forward-reference safety: pre-v0.26.5 brains have no `archived` column.
-    // Re-issue without it; archived defaults to false.
+    // Forward-reference safety: pre-v0.26.5 brains lack `archived`; pre-v109
+    // brains lack `newest_content_at`. Re-issue with the historical minimal
+    // set; archived defaults false, newest_content_at undefined → wall-clock.
     if (isUndefinedColumnError(err)) {
       rows = await engine.executeRaw<SourceRow>(
         `SELECT id, name, local_path, last_commit, last_sync_at, config, created_at
@@ -102,7 +205,7 @@ export async function fetchSource(
 ): Promise<SourceRow | null> {
   try {
     const rows = await engine.executeRaw<SourceRow>(
-      `SELECT id, name, local_path, last_commit, last_sync_at, config, created_at, archived
+      `SELECT id, name, local_path, last_commit, last_sync_at, config, created_at, archived, newest_content_at
          FROM sources WHERE id = $1`,
       [id],
     );

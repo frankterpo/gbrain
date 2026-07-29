@@ -23,7 +23,7 @@
  *      (second call no-ops).
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import * as db from '../../src/core/db.ts';
 
@@ -35,12 +35,13 @@ if (skip) {
   console.log('Skipping postgres-engine-disconnect-idempotency E2E (DATABASE_URL not set)');
 }
 
-describe.skipIf(skip)('PostgresEngine.disconnect idempotency', () => {
-  beforeAll(async () => {
-    // Establish the module-level connection so we can verify it survives
-    // the instance-pool engine's double-disconnect.
+const ok1 = (rows: unknown[]) => (rows[0] as { ok: number }).ok;
+
+describe.skipIf(skip)('PostgresEngine.disconnect idempotency + module-singleton ownership (#1471)', () => {
+  // Every test builds its own module-singleton scenario from a clean slate, so
+  // order is irrelevant and the ownership cases don't leak state into each other.
+  beforeEach(async () => {
     await db.disconnect();
-    await db.connect({ database_url: DATABASE_URL! });
   }, 30_000);
 
   afterAll(async () => {
@@ -48,75 +49,85 @@ describe.skipIf(skip)('PostgresEngine.disconnect idempotency', () => {
   });
 
   test('instance-pool engine: second disconnect() does NOT clobber module singleton', async () => {
+    // Establish a module-level baseline (the cycle's singleton).
+    await db.connect({ database_url: DATABASE_URL! });
+
     const engine = new PostgresEngine();
     await engine.connect({ database_url: DATABASE_URL!, poolSize: 2 });
 
-    // First disconnect — closes the engine's own pool.
     await engine.disconnect();
+    expect(ok1(await db.getConnection().unsafe('SELECT 1 as ok'))).toBe(1);
 
-    // Sanity: module-level connection still alive (this is what
-    // helpers.ts's getConn() returns).
-    const before = await db.getConnection().unsafe('SELECT 1 as ok');
-    expect((before[0] as unknown as { ok: number }).ok).toBe(1);
-
-    // Second disconnect — pre-fix, this fell through to db.disconnect()
-    // and cleared the module-level singleton. Post-fix, it's a no-op.
+    // Second disconnect — pre-fix this fell through to db.disconnect() and
+    // cleared the module-level singleton. Post-fix it's a no-op (instance style).
     await engine.disconnect();
-
-    // Module-level connection MUST still be alive.
-    const after = await db.getConnection().unsafe('SELECT 1 as ok');
-    expect((after[0] as unknown as { ok: number }).ok).toBe(1);
+    expect(ok1(await db.getConnection().unsafe('SELECT 1 as ok'))).toBe(1);
   });
 
-  test('module-singleton engine: second disconnect() is a no-op', async () => {
-    // Re-establish module-level connection (idempotent; no-op if still
-    // connected from beforeAll).
-    await db.connect({ database_url: DATABASE_URL! });
+  test('owner-first / borrower-second: a borrower disconnect must NOT null the owner singleton', async () => {
+    // The exact dream-cycle bug: the owner (cycle engine) creates the singleton,
+    // a probe (lint/doctor config-lift) borrows it, the probe disconnects, and
+    // pre-fix that nulled the singleton the owner was still using.
+    const owner = new PostgresEngine();
+    await owner.connect({ database_url: DATABASE_URL! }); // module branch → creates → owns
+    const borrower = new PostgresEngine();
+    await borrower.connect({ database_url: DATABASE_URL! }); // singleton exists → borrows
 
+    await borrower.disconnect(); // pre-fix: db.disconnect() → singleton null
+
+    // The owner must still be able to run DB work (this is sync/synthesize).
+    expect(ok1(await owner.executeRaw('SELECT 1 as ok'))).toBe(1);
+    expect(() => db.getConnection()).not.toThrow();
+
+    // And the owner — the true creator — DOES tear it down.
+    await owner.disconnect();
+    expect(() => db.getConnection()).toThrow(/No database connection/);
+  });
+
+  test('ownership tracks CREATION, not role: a probe that creates the singleton owns it', async () => {
+    // codex #2: ownership is not "the cycle engine" by name — it is whoever
+    // atomically created the pool. If a probe creates first, it owns; a later
+    // joiner is the borrower. (Safe in gbrain because the CLI engine is always
+    // the first creator and last to disconnect — the dominance invariant.)
+    const firstCreator = new PostgresEngine();
+    await firstCreator.connect({ database_url: DATABASE_URL! }); // creates → owns
+    const joiner = new PostgresEngine();
+    await joiner.connect({ database_url: DATABASE_URL! }); // joins → borrows
+
+    await joiner.disconnect(); // no-op on the singleton
+    expect(() => db.getConnection()).not.toThrow();
+    await firstCreator.disconnect(); // creator tears down
+    expect(() => db.getConnection()).toThrow(/No database connection/);
+  });
+
+  test('symmetric CLI-exit: a sole owner connect+disconnect tears the singleton down (no hang regression)', async () => {
     const engine = new PostgresEngine();
-    // No poolSize → uses the module-level singleton.
     await engine.connect({ database_url: DATABASE_URL! });
-
-    // First disconnect. The module singleton already existed (beforeAll +
-    // the db.connect() above), so this engine is a BORROWER, not the owner
-    // (#1570). Borrower disconnect leaves the shared singleton intact — see
-    // the dedicated regression below. Either way it must not throw.
     await engine.disconnect();
-
-    // Second disconnect must NOT throw — should be a no-op since
-    // _connectionStyle was reset to null.
+    // Pool must be CLOSED so the CLI event loop drains and `gbrain init` /
+    // op-dispatch exit cleanly (the failure mode refcount would risk).
+    expect(() => db.getConnection()).toThrow(/No database connection/);
+    // Idempotent second disconnect.
     await expect(engine.disconnect()).resolves.toBeUndefined();
   });
 
-  test('#1570: a borrower engine that reused the shared singleton must NOT clobber it on disconnect', async () => {
-    // The shared module singleton is live for the whole "cycle" — this
-    // mirrors the autopilot worker, whose main engine OWNS the singleton
-    // for the duration of runCycle().
-    await db.connect({ database_url: DATABASE_URL! });
-    expect(db.isConnected()).toBe(true);
-
-    // A throwaway "borrower" engine reuses the live singleton — exactly what
-    // lint's resolveLintContentSanity() does via `engine.connect({})` to read
-    // a few config keys from the DB plane mid-cycle. db.connect() early-
-    // returns (reuse) because a connection already exists, so this engine
-    // never created the singleton and must not own its teardown.
+  test('owner reconnect with a live borrower: borrower resolves the rebuilt singleton', async () => {
+    const owner = new PostgresEngine();
+    await owner.connect({ database_url: DATABASE_URL! }); // owns
     const borrower = new PostgresEngine();
-    await borrower.connect({}); // empty config — identical to lint's call
+    await borrower.connect({ database_url: DATABASE_URL! }); // borrows
 
-    // Pre-fix, this fell through to db.disconnect() and NULLED the shared
-    // singleton mid-cycle. The next phase (conversation_facts_backfill)
-    // then threw "No database connection: connect() has not been called",
-    // and the worker's own failure-recording write hit the same error →
-    // unhandled rejection → `worker exited code=1`.
-    await borrower.disconnect();
+    // Owner reconnect (the batchRetry path): tears down the old singleton and
+    // builds a fresh one, re-acquiring ownership via the atomic db.connect() token.
+    await owner.reconnect();
 
-    // The shared singleton MUST still be alive for the rest of the cycle.
-    expect(db.isConnected()).toBe(true);
-    const rows = await db.getConnection().unsafe('SELECT 1 as ok');
-    expect((rows[0] as unknown as { ok: number }).ok).toBe(1);
+    // The borrower's normal query path (this.sql → db.getConnection()) resolves
+    // the NEW singleton. (codex #4: the borrower's cached connectionManager pool
+    // is stale — that ddl()-only edge is a filed TODO, not this normal path.)
+    expect(ok1(await borrower.sql.unsafe('SELECT 1 as ok'))).toBe(1);
+    expect(ok1(await owner.executeRaw('SELECT 1 as ok'))).toBe(1);
 
-    // And the true owner can still tear it down explicitly afterwards.
-    await db.disconnect();
-    expect(db.isConnected()).toBe(false);
+    await owner.disconnect();
+    expect(() => db.getConnection()).toThrow(/No database connection/);
   });
 });

@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('bumped to 6 to invalidate caches across v0.42 boost stage addition', () => {
-    expect(KNOBS_HASH_VERSION).toBe(6);
+  it('is 14 (13→14 compiled_truth boost no longer applies at detail=medium, so pre-fix rankings must be unreachable, #3430)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(14);
   });
 });

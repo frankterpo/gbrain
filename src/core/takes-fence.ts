@@ -134,6 +134,7 @@ export const TAKES_FENCE_END   = '<!--- gbrain:takes:end -->';
 import { SLUG_SEGMENT_PATTERN } from './sync.ts';
 export const HOLDER_REGEX = new RegExp(
   `^(?:world|brain|(?:people|companies)/${SLUG_SEGMENT_PATTERN.source}|${SLUG_SEGMENT_PATTERN.source})$`,
+  'u', // required by SLUG_SEGMENT_PATTERN's \p{...} classes (#3417)
 );
 
 /**
@@ -547,6 +548,10 @@ export function supersedeRow(
  * unchanged.
  */
 export function stripTakesFence(body: string): string {
+  // Pages without a compiled body (e.g. metadata-only rows from a read op)
+  // have nothing to strip. Guard so the privacy strip is a safe no-op rather
+  // than crashing on `undefined.indexOf`.
+  if (typeof body !== 'string') return body;
   const beginIdx = body.indexOf(TAKES_FENCE_BEGIN);
   if (beginIdx === -1) return body;
   const endIdx = body.indexOf(TAKES_FENCE_END, beginIdx + TAKES_FENCE_BEGIN.length);
