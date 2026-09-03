@@ -172,6 +172,18 @@ export function validatePageSlug(slug: string): void {
 }
 
 /**
+ * Strip search-hit display decorations from a slug argument before lookup.
+ * Agents sometimes pass the full CLI/MCP search line (`[score] slug -- # Title`)
+ * instead of the bare slug. Idempotent on already-clean slugs.
+ */
+export function normalizePageSlugInput(slug: string): string {
+  let s = slug.trim();
+  s = s.replace(/^\[[\d.]+\]\s*/, '');
+  s = s.replace(/\s+(?:—|--|-)\s+#\s+.*$/, '');
+  return s.trim();
+}
+
+/**
  * Match a slug against a list of allow-list prefix globs.
  *
  * Glob form: `<prefix>/*` matches any slug starting with `<prefix>/` and
@@ -756,7 +768,7 @@ const get_page: Operation = {
     include_deleted: { type: 'boolean', description: 'v0.26.5: surface soft-deleted pages with deleted_at populated (default: false). Used by restore workflows.' },
   },
   handler: async (ctx, p) => {
-    const slug = p.slug as string;
+    const slug = normalizePageSlugInput(p.slug as string);
     const fuzzy = (p.fuzzy as boolean) || false;
     const includeDeleted = (p.include_deleted as boolean) === true;
     // #1393: route BOTH the exact-match read and the fuzzy resolveSlugs through
